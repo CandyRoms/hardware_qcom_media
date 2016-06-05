@@ -615,10 +615,10 @@ bool venc_dev::handle_input_extradata(void *buffer, int fd)
         return false;
     }
 
-    if (!(control.value & V4L2_MPEG_VIDC_EXTRADATA_YUV_STATS ||
-        control.value & V4L2_MPEG_VIDC_EXTRADATA_VQZIP_SEI ||
-        control.value & V4L2_MPEG_VIDC_EXTRADATA_FRAME_QP ||
-        control.value & V4L2_MPEG_VIDC_EXTRADATA_INPUT_CROP)) {
+    if (!(control.value == V4L2_MPEG_VIDC_EXTRADATA_YUV_STATS ||
+        control.value == V4L2_MPEG_VIDC_EXTRADATA_VQZIP_SEI ||
+        control.value == V4L2_MPEG_VIDC_EXTRADATA_FRAME_QP ||
+        control.value == V4L2_MPEG_VIDC_EXTRADATA_INPUT_CROP)) {
         DEBUG_PRINT_LOW("Input extradata not enabled");
         return true;
     }
@@ -699,8 +699,8 @@ bool venc_dev::handle_input_extradata(void *buffer, int fd)
             p_extra = (OMX_OTHER_EXTRADATATYPE *)((char *)p_extra + p_extra->nSize);
         }
 
-        if (control.value & V4L2_MPEG_VIDC_EXTRADATA_YUV_STATS ||
-            control.value & V4L2_MPEG_VIDC_EXTRADATA_VQZIP_SEI) {
+        if (control.value == V4L2_MPEG_VIDC_EXTRADATA_YUV_STATS ||
+            control.value == V4L2_MPEG_VIDC_EXTRADATA_VQZIP_SEI) {
             if (!mInputExtradata.vqzip_sei_found) {
                 DEBUG_PRINT_ERROR("VQZIP is enabled, But no VQZIP SEI found. Rejecting the session");
                 munmap(pVirt, size);
@@ -811,9 +811,17 @@ int venc_dev::venc_set_format(int format)
 {
     int rc = true;
 
-    if (format)
+    if (format) {
         color_format = format;
-    else {
+
+        switch (color_format) {
+        case NV12_128m:
+            return venc_set_color_format((OMX_COLOR_FORMATTYPE)QOMX_COLOR_FORMATYUV420PackedSemiPlanar32m);
+        default:
+            return false;
+        }
+
+    } else {
         color_format = 0;
         rc = false;
     }
@@ -1195,6 +1203,8 @@ bool venc_dev::venc_open(OMX_U32 codec)
         m_sOutput_buff_property.alignment = SZ_4K;
         m_sInput_buff_property.alignment  = SZ_4K;
     }
+
+    memset(&fmt, 0, sizeof(fmt));
     fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
     fmt.fmt.pix_mp.height = m_sVenc_cfg.dvs_height;
     fmt.fmt.pix_mp.width = m_sVenc_cfg.dvs_width;
@@ -1211,6 +1221,7 @@ bool venc_dev::venc_open(OMX_U32 codec)
 
     m_sOutput_buff_property.datasize=fmt.fmt.pix_mp.plane_fmt[0].sizeimage;
 
+    memset(&fmt, 0, sizeof(fmt));
     fmt.type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
     fmt.fmt.pix_mp.height = m_sVenc_cfg.input_height;
     fmt.fmt.pix_mp.width = m_sVenc_cfg.input_width;
@@ -1496,6 +1507,7 @@ bool venc_dev::venc_get_buf_req(OMX_U32 *min_buff_count,
         mInputExtradata.update(m_sInput_buff_property.actualcount + 1, extra_data_size);
     } else {
         unsigned int extra_idx = 0;
+        memset(&fmt, 0, sizeof(fmt));
         fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
         fmt.fmt.pix_mp.height = m_sVenc_cfg.dvs_height;
         fmt.fmt.pix_mp.width = m_sVenc_cfg.dvs_width;
@@ -1584,6 +1596,8 @@ bool venc_dev::venc_set_param(void *paramData, OMX_INDEXTYPE index)
                         DEBUG_PRINT_LOW("Basic parameter has changed");
                         m_sVenc_cfg.input_height = portDefn->format.video.nFrameHeight;
                         m_sVenc_cfg.input_width = portDefn->format.video.nFrameWidth;
+
+                        memset(&fmt, 0, sizeof(fmt));
                         fmt.type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
                         fmt.fmt.pix_mp.height = m_sVenc_cfg.input_height;
                         fmt.fmt.pix_mp.width = m_sVenc_cfg.input_width;
@@ -1617,6 +1631,8 @@ bool venc_dev::venc_set_param(void *paramData, OMX_INDEXTYPE index)
                 } else if (portDefn->nPortIndex == PORT_INDEX_OUT) {
                     m_sVenc_cfg.dvs_height = portDefn->format.video.nFrameHeight;
                     m_sVenc_cfg.dvs_width = portDefn->format.video.nFrameWidth;
+
+                    memset(&fmt, 0, sizeof(fmt));
                     fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
                     fmt.fmt.pix_mp.height = m_sVenc_cfg.dvs_height;
                     fmt.fmt.pix_mp.width = m_sVenc_cfg.dvs_width;
@@ -3166,6 +3182,7 @@ bool venc_dev::venc_empty_buf(void *buffer, void *pmem_data_buf, unsigned index,
                     return false;
                 }
             } else if (!color_format) {
+                int usage = 0;
 
                 if (meta_buf->buffer_type == kMetadataBufferTypeCameraSource) {
                     native_handle_t *hnd = (native_handle_t*)meta_buf->meta_handle;
@@ -3174,24 +3191,26 @@ bool venc_dev::venc_empty_buf(void *buffer, void *pmem_data_buf, unsigned index,
                         return false;
                     }
 
+                    if (!mBatchSize && hnd->numFds + hnd->numInts > 3) {
+                        usage = hnd->data[3];
+                    } else if (mBatchSize) {
+                        usage = BatchInfo::getColorFormatAt(hnd, 0);
+                    }
+                    if (usage & private_handle_t::PRIV_FLAGS_ITU_R_709) {
+                        buf.flags = V4L2_MSM_BUF_FLAG_YUV_601_709_CLAMP;
+                    }
+
                     if (!streaming[OUTPUT_PORT] && !(m_sVenc_cfg.inputformat == V4L2_PIX_FMT_RGB32 ||
                         m_sVenc_cfg.inputformat == V4L2_PIX_FMT_RGBA8888_UBWC)) {
-                        int usage = 0;
                         struct v4l2_format fmt;
+
+                        memset(&fmt, 0, sizeof(fmt));
                         fmt.type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
                         m_sVenc_cfg.inputformat = V4L2_PIX_FMT_NV12;
                         fmt.fmt.pix_mp.height = m_sVenc_cfg.input_height;
                         fmt.fmt.pix_mp.width = m_sVenc_cfg.input_width;
-                        if (!mBatchSize && hnd->numFds + hnd->numInts > 3) {
-                            usage = hnd->data[3];
-                        } else if (mBatchSize) {
-                            usage = BatchInfo::getColorFormatAt(hnd, 0);
-                        }
                         if (usage & private_handle_t::PRIV_FLAGS_UBWC_ALIGNED) {
                             m_sVenc_cfg.inputformat = V4L2_PIX_FMT_NV12_UBWC;
-                        }
-                        if (usage & private_handle_t::PRIV_FLAGS_ITU_R_709) {
-                            buf.flags = V4L2_MSM_BUF_FLAG_YUV_601_709_CLAMP;
                         }
                         fmt.fmt.pix_mp.pixelformat = m_sVenc_cfg.inputformat;
                         if (ioctl(m_nDriver_fd, VIDIOC_S_FMT, &fmt)) {
@@ -3227,6 +3246,8 @@ bool venc_dev::venc_empty_buf(void *buffer, void *pmem_data_buf, unsigned index,
                     private_handle_t *handle = (private_handle_t *)meta_buf->meta_handle;
                     if (!streaming[OUTPUT_PORT]) {
                         struct v4l2_format fmt;
+                        memset(&fmt, 0, sizeof(fmt));
+
                         fmt.type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
                         if (handle->format == HAL_PIXEL_FORMAT_NV12_ENCODEABLE) {
                             if ((handle->flags & private_handle_t::PRIV_FLAGS_UBWC_ALIGNED) &&
@@ -4866,6 +4887,7 @@ bool venc_dev::venc_set_color_format(OMX_COLOR_FORMATTYPE color_format)
             break;
     }
 
+    memset(&fmt, 0, sizeof(fmt));
     fmt.type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
     fmt.fmt.pix_mp.pixelformat = m_sVenc_cfg.inputformat;
     fmt.fmt.pix_mp.height = m_sVenc_cfg.input_height;
@@ -5300,6 +5322,7 @@ bool venc_dev::venc_set_vpe_rotation(OMX_S32 rotation_angle)
     }
     DEBUG_PRINT_LOW("Success IOCTL set control for id=%x, value=%d", control.id, control.value);
 
+    memset(&fmt, 0, sizeof(fmt));
     fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
     fmt.fmt.pix_mp.height = m_sVenc_cfg.dvs_height;
     fmt.fmt.pix_mp.width = m_sVenc_cfg.dvs_width;
@@ -5449,7 +5472,8 @@ bool venc_dev::venc_set_ratectrl_cfg(OMX_VIDEO_CONTROLRATETYPE eControlRate)
         rate_ctrl.rcmode = control.value;
     }
 
-    if (eControlRate == OMX_Video_ControlRateVariable && (supported_rc_modes & RC_VBR_CFR)) {
+    if (eControlRate == OMX_Video_ControlRateVariable && (supported_rc_modes & RC_VBR_CFR)
+        && m_sVenc_cfg.codectype == V4L2_PIX_FMT_H264) {
         /* Enable VQZIP SEI by default for camcorder RC modes */
 
         control.id = V4L2_CID_MPEG_VIDC_VIDEO_VQZIP_SEI;
@@ -6555,9 +6579,11 @@ encExtradata::encExtradata(class omx_venc *venc_handle)
 {
     mCount = 0;
     mSize = 0;
+    mUaddr = NULL;
+    memset(&mIon, -1, sizeof(struct venc_ion));
+    memset(mIndex, 0, sizeof(mIndex));
     mVencHandle = venc_handle;
     mDbgEtbCount = 0;
-    memset(mIndex, 0, sizeof(mIndex));
     pthread_mutex_init(&lock, NULL);
     vqzip_sei_found = false;
 }

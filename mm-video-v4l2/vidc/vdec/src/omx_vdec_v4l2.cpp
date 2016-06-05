@@ -149,8 +149,6 @@ extern "C" {
 static OMX_U32 maxSmoothStreamingWidth = 1920;
 static OMX_U32 maxSmoothStreamingHeight = 1088;
 
-bool omx_vdec::m_disable_ubwc_mode;
-
 void* async_message_thread (void *input)
 {
     OMX_BUFFERHEADERTYPE *buffer;
@@ -337,9 +335,27 @@ void* message_thread(void *input)
     unsigned char id;
     int n;
 
+    fd_set readFds;
+    int res = 0;
+    struct timeval tv;
+
     DEBUG_PRINT_HIGH("omx_vdec: message thread start");
     prctl(PR_SET_NAME, (unsigned long)"VideoDecMsgThread", 0, 0, 0);
-    while (1) {
+    while (!omx->message_thread_stop) {
+
+        tv.tv_sec = 2;
+        tv.tv_usec = 0;
+
+        FD_ZERO(&readFds);
+        FD_SET(omx->m_pipe_in, &readFds);
+
+        res = select(omx->m_pipe_in + 1, &readFds, NULL, NULL, &tv);
+        if (res < 0) {
+            DEBUG_PRINT_ERROR("select() ERROR: %s", strerror(errno));
+            continue;
+        } else if (res == 0 /*timeout*/ || omx->message_thread_stop) {
+            continue;
+        }
 
         n = read(omx->m_pipe_in, &id, 1);
 
@@ -348,9 +364,6 @@ void* message_thread(void *input)
         }
 
         if (1 == n) {
-            if (omx->omx_close_msg_thread(id)) {
-                break;
-            }
             omx->process_event_cb(omx, id);
         }
 
@@ -368,7 +381,11 @@ void post_message(omx_vdec *omx, unsigned char id)
     int ret_value;
     DEBUG_PRINT_LOW("omx_vdec: post_message %d pipe out%d", id,omx->m_pipe_out);
     ret_value = write(omx->m_pipe_out, &id, 1);
-    DEBUG_PRINT_LOW("post_message to pipe done %d",ret_value);
+    if (ret_value <= 0) {
+        DEBUG_PRINT_ERROR("post_message to pipe failed : %s", strerror(errno));
+    } else {
+        DEBUG_PRINT_LOW("post_message to pipe done %d",ret_value);
+    }
 }
 
 // omx_cmd_queue destructor
@@ -729,6 +746,7 @@ omx_vdec::omx_vdec(): m_error_propogated(false),
     msg_thread_created = false;
     async_thread_created = false;
     async_thread_force_stop = false;
+    message_thread_stop = false;
 #ifdef _ANDROID_ICS_
     memset(&native_buffer, 0 ,(sizeof(struct nativebuffer) * MAX_NUM_INPUT_OUTPUT_BUFFERS));
 #endif
@@ -856,11 +874,13 @@ omx_vdec::~omx_vdec()
 {
     m_pmem_info = NULL;
     DEBUG_PRINT_HIGH("In OMX vdec Destructor");
-    DEBUG_PRINT_HIGH("Signalling close to OMX Msg Thread");
-    post_message(this, OMX_COMPONENT_CLOSE_MSG);
-    DEBUG_PRINT_HIGH("Waiting on OMX Msg Thread exit");
-    if (msg_thread_created)
+    if (msg_thread_created) {
+        DEBUG_PRINT_HIGH("Signalling close to OMX Msg Thread");
+        message_thread_stop = true;
+        post_message(this, OMX_COMPONENT_CLOSE_MSG);
+        DEBUG_PRINT_HIGH("Waiting on OMX Msg Thread exit");
         pthread_join(msg_thread_id,NULL);
+    }
     close(m_pipe_in);
     close(m_pipe_out);
     m_pipe_in = -1;
@@ -4785,6 +4805,20 @@ OMX_ERRORTYPE  omx_vdec::set_parameter(OMX_IN OMX_HANDLETYPE     hComp,
             m_force_compressed_for_dpb = pParam->bEnable;
             break;
         }
+        case OMX_QTIIndexParamForceUnCompressedForOPB:
+        {
+            DEBUG_PRINT_LOW("set_parameter: OMX_QTIIndexParamForceUnCompressedForOPB");
+            OMX_QTI_VIDEO_PARAM_FORCE_UNCOMPRESSED_FOR_OPB_TYPE *pParam =
+                (OMX_QTI_VIDEO_PARAM_FORCE_UNCOMPRESSED_FOR_OPB_TYPE *)paramData;
+            if (!paramData) {
+                DEBUG_PRINT_ERROR("set_parameter: OMX_QTIIndexParamForceUnCompressedForOPB paramData is NULL");
+                eRet = OMX_ErrorBadParameter;
+                break;
+            }
+            m_disable_ubwc_mode = pParam->bEnable;
+            DEBUG_PRINT_LOW("set_parameter: UBWC %s for OPB", pParam->bEnable ? "disabled" : "enabled");
+            break;
+        }
 
 
         default: {
@@ -5106,6 +5140,8 @@ OMX_ERRORTYPE  omx_vdec::set_config(OMX_IN OMX_HANDLETYPE      hComp,
                 OMX_ErrorUnsupportedSetting : OMX_ErrorNone;
         if (ret)
             DEBUG_PRINT_ERROR("Failed to set picture type decode");
+
+        return ret;
     } else if ((int)configIndex == (int)OMX_IndexConfigPriority) {
         OMX_PARAM_U32TYPE *priority = (OMX_PARAM_U32TYPE *)configData;
         DEBUG_PRINT_LOW("Set_config: priority %d",priority->nU32);
@@ -5214,6 +5250,8 @@ OMX_ERRORTYPE  omx_vdec::get_extension_index(OMX_IN OMX_HANDLETYPE      hComp,
         *indexType = (OMX_INDEXTYPE)OMX_QTIIndexParamPassInputBufferFd;
     } else if (extn_equals(paramName, "OMX.QTI.index.param.video.ForceCompressedForDPB")) {
         *indexType = (OMX_INDEXTYPE)OMX_QTIIndexParamForceCompressedForDPB;
+    } else if (extn_equals(paramName, "OMX.QTI.index.param.video.ForceUnCompressedForOPB")) {
+        *indexType = (OMX_INDEXTYPE)OMX_QTIIndexParamForceUnCompressedForOPB;
     } else {
         DEBUG_PRINT_ERROR("Extension: %s not implemented", paramName);
         return OMX_ErrorNotImplemented;
@@ -7223,8 +7261,8 @@ OMX_ERRORTYPE  omx_vdec::fill_this_buffer_proxy(
     }
     buf.m.planes = plane;
     buf.length = drv_ctx.num_planes;
-    DEBUG_PRINT_LOW("SENDING FTB TO F/W - fd[0] = %d fd[1] = %d offset[1] = %d",
-             plane[0].reserved[0],plane[extra_idx].reserved[0], plane[extra_idx].reserved[1]);
+    DEBUG_PRINT_LOW("SENDING FTB TO F/W - fd[0] = %d fd[1] = %d offset[1] = %d in_flush = %d",
+             plane[0].reserved[0],plane[extra_idx].reserved[0], plane[extra_idx].reserved[1], output_flush_progress);
 
     rc = ioctl(drv_ctx.video_driver_fd, VIDIOC_QBUF, &buf);
     if (rc) {
@@ -8270,6 +8308,7 @@ int omx_vdec::async_message_process (void *context, void* message)
                     }
 
                     if (omxhdr && (v4l2_buf_ptr->flags & V4L2_QCOM_BUF_DROP_FRAME) &&
+                            !omx->output_flush_progress &&
                             !(v4l2_buf_ptr->flags & V4L2_QCOM_BUF_FLAG_DECODEONLY) &&
                             !(v4l2_buf_ptr->flags & V4L2_QCOM_BUF_FLAG_EOS)) {
                         unsigned int index = v4l2_buf_ptr->index;
@@ -8301,6 +8340,8 @@ int omx_vdec::async_message_process (void *context, void* message)
                             return -1;
                         }
 
+                         DEBUG_PRINT_LOW("SENDING FTB TO F/W from async_message_process - fd[0] = %d fd[1] = %d offset[1] = %d in_flush = %d",
+                               plane[0].reserved[0],plane[extra_idx].reserved[0], plane[extra_idx].reserved[1], omx->output_flush_progress);
                         if(ioctl(omx->drv_ctx.video_driver_fd, VIDIOC_QBUF, v4l2_buf_ptr)) {
                             DEBUG_PRINT_ERROR("Failed to queue buffer back to driver: %d, %d, %d", v4l2_buf_ptr->length, v4l2_buf_ptr->m.planes[0].reserved[0], v4l2_buf_ptr->m.planes[1].reserved[0]);
                             return -1;
